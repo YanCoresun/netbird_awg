@@ -1,0 +1,93 @@
+name: NetBird AWG Reverse Proxy Image
+
+# Builds netbird-proxy (reverse proxy) from AWG-patched sources and pushes to GHCR.
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Base tag (empty = NETBIRD_BASE_TAG from .env)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  proxy_image:
+    runs-on: ubuntu-latest
+    env:
+      WORKDIR: ${{ github.workspace }}/workdir
+      BASE_TAG: ${{ github.event.inputs.base_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve vars
+        run: |
+          ./scripts/version_vars.sh --github-env >> "$GITHUB_ENV"
+          ./scripts/version_vars.sh --print
+
+      - name: Clone sources
+        run: ./scripts/clone_sources.sh
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ github.workspace }}/workdir/repos/netbird/go.mod
+          cache: true
+          cache-dependency-path: |
+            ${{ github.workspace }}/workdir/repos/netbird/go.mod
+            ${{ github.workspace }}/workdir/repos/netbird/go.sum
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc Go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Prepare sources
+        run: ./scripts/prepare_sources.sh
+
+      - name: Build netbird-proxy binaries
+        run: |
+          cd "$GITHUB_WORKSPACE/workdir/repos/netbird"
+          LDFLAGS="-s -w -X github.com/netbirdio/netbird/version.version=${NETBIRD_RELEASE_TAG}"
+          for arch in amd64 arm64; do
+            mkdir -p linux/$arch
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags="$LDFLAGS" \
+              -o linux/$arch/netbird-proxy ./proxy/cmd/proxy
+          done
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/netbird_awg_proxy" >> "$GITHUB_ENV"
+
+      - name: Push proxy image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}/workdir/repos/netbird
+          file: ${{ github.workspace }}/workdir/repos/netbird/proxy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE }}:${{ env.NETBIRD_RELEASE_TAG }}
+            ${{ env.IMAGE }}:latest
