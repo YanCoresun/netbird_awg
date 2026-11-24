@@ -1,0 +1,96 @@
+name: NetBird AWG OpenWrt Client
+
+# Builds the AWG-patched netbird client as static binaries for OpenWrt routers
+# (UPX-compressed) and publishes them to a GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Base tag (empty = NETBIRD_BASE_TAG from .env)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  openwrt_client:
+    runs-on: ubuntu-latest
+    env:
+      WORKDIR: ${{ github.workspace }}/workdir
+      BASE_TAG: ${{ github.event.inputs.base_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve vars
+        run: |
+          ./scripts/version_vars.sh --github-env >> "$GITHUB_ENV"
+          ./scripts/version_vars.sh --print
+
+      - name: Clone sources
+        run: ./scripts/clone_sources.sh
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ github.workspace }}/workdir/repos/netbird/go.mod
+          cache: true
+          cache-dependency-path: |
+            ${{ github.workspace }}/workdir/repos/netbird/go.mod
+            ${{ github.workspace }}/workdir/repos/netbird/go.sum
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc Go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Prepare sources
+        run: ./scripts/prepare_sources.sh
+
+      - name: Install UPX
+        run: |
+          curl -fsSL https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz | tar -xJ
+          sudo mv upx-4.2.4-amd64_linux/upx /usr/local/bin/upx
+          upx --version | head -1
+
+      - name: Build client binaries
+        run: |
+          cd "$GITHUB_WORKSPACE/workdir/repos/netbird"
+          LDFLAGS="-s -w -X github.com/netbirdio/netbird/version.version=${NETBIRD_RELEASE_TAG}"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          build() {
+            name=$1; shift
+            env CGO_ENABLED=0 GOOS=linux "$@" go build -trimpath -ldflags="$LDFLAGS" \
+              -o "$GITHUB_WORKSPACE/out/netbird-$name" ./client
+            cp "$GITHUB_WORKSPACE/out/netbird-$name" "$GITHUB_WORKSPACE/out/netbird-$name.raw"
+            upx --best --lzma -q "$GITHUB_WORKSPACE/out/netbird-$name" || echo "upx failed for $name"
+          }
+          build mipsel_24kc GOARCH=mipsle GOMIPS=softfloat
+          build mips_24kc   GOARCH=mips   GOMIPS=softfloat
+          build arm_cortex-a7 GOARCH=arm GOARM=7
+          build aarch64     GOARCH=arm64
+          cd "$GITHUB_WORKSPACE/out"
+          rm -f *.raw.upx
+          ls -la
+          sha256sum netbird-* > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="openwrt-${NETBIRD_RELEASE_TAG}"
+          cd "$GITHUB_WORKSPACE/out"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "OpenWrt AWG client ${NETBIRD_RELEASE_TAG}" \
+            --notes "Static AWG-patched netbird client for OpenWrt. netbird-<arch> = UPX-compressed, netbird-<arch>.raw = uncompressed." \
+            netbird-* SHA256SUMS
