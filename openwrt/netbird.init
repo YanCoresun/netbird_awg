@@ -19,7 +19,11 @@ start_service() {
 	# wrapper: fetch the binary (retry until internet is up), then exec the daemon
 	procd_set_param command /bin/sh -c "
 		while [ ! -x $BIN ]; do
-			uclient-fetch -q -T 30 -O $BIN.part '$URL' && mv $BIN.part $BIN && chmod +x $BIN && break
+			if command -v curl >/dev/null; then
+				curl -fsSL --connect-timeout 10 --max-time 300 --retry 3 -o $BIN.part '$URL'
+			else
+				uclient-fetch -q -T 30 -O $BIN.part '$URL'
+			fi && mv $BIN.part $BIN && chmod +x $BIN && break
 			rm -f $BIN.part; logger -t netbird 'download failed, retry in 15s'; sleep 15
 		done
 		exec $BIN service run --log-file console --log-level info
